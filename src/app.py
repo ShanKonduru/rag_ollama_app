@@ -1,10 +1,12 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
+import shutil
+import pandas as pd
+from datetime import datetime
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader, UnstructuredPowerPointLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-# from langchain_community.embeddings import OllamaEmbeddings
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
@@ -16,21 +18,63 @@ from langchain.schema import HumanMessage, AIMessage
 load_dotenv()
 
 # --- Configuration ---
-VECTOR_DB_PATH = "faiss_index" # Directory to save the FAISS vector store
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+BASE_VECTOR_DB_DIR = "knowledge_base" # Base directory for all versioned vector stores
+MASTER_VERSION_CONTROL_FILE = os.path.join(BASE_VECTOR_DB_DIR, "MasterVersionControl.csv")
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
 OLLAMA_MODEL = "llama2:13b" # Make sure you have this model pulled in Ollama (e.g., ollama pull llama3)
 
 # --- Helper Functions ---
 
+def ensure_base_directories_exist():
+    """Ensures the base directory for vector stores and temp directory exist."""
+    os.makedirs(BASE_VECTOR_DB_DIR, exist_ok=True)
+    os.makedirs("temp", exist_ok=True) # Ensure temp directory for uploads
+
+def get_next_version_number():
+    """Determines the next sequential version number (e.g., v1.0, v2.0)."""
+    if not os.path.exists(MASTER_VERSION_CONTROL_FILE):
+        return "v1.0"
+    
+    df = pd.read_csv(MASTER_VERSION_CONTROL_FILE)
+    if df.empty:
+        return "v1.0"
+    
+    # Extract version numbers, convert to float, find max, increment
+    # Assumes versions are like 'vX.Y' and we only increment X for new builds
+    latest_version = df['Version'].str.replace('v', '').astype(float).max()
+    next_version = f"v{latest_version + 1:.1f}"
+    return next_version
+
+def update_master_version_control(version, file_details):
+    """Updates the MasterVersionControl.csv with details of the new vector store version."""
+    new_entry = {
+        "Version": version,
+        "Timestamp": datetime.now().isoformat(),
+        "Files_Used": file_details # This will be a string of file names
+    }
+    
+    df_new = pd.DataFrame([new_entry])
+    
+    if not os.path.exists(MASTER_VERSION_CONTROL_FILE) or pd.read_csv(MASTER_VERSION_CONTROL_FILE).empty:
+        df_new.to_csv(MASTER_VERSION_CONTROL_FILE, index=False)
+    else:
+        df_existing = pd.read_csv(MASTER_VERSION_CONTROL_FILE)
+        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+        df_combined.to_csv(MASTER_VERSION_CONTROL_FILE, index=False)
+
 def load_documents(uploaded_files):
     """Loads various document types using LangChain's loaders."""
     documents = []
+    uploaded_file_paths = []
     for uploaded_file in uploaded_files:
-        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
-        with open(os.path.join("temp", uploaded_file.name), "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        # Save to temp directory
         file_path = os.path.join("temp", uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        uploaded_file_paths.append(file_path) # Store path for logging
+
+        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
 
         if file_extension == ".pdf":
             loader = PyPDFLoader(file_path)
@@ -46,7 +90,7 @@ def load_documents(uploaded_files):
             st.warning(f"Skipping unsupported file type: {uploaded_file.name}")
             continue
         documents.extend(loader.load())
-    return documents
+    return documents, uploaded_file_paths
 
 def get_text_chunks(documents):
     """Splits documents into smaller, manageable chunks."""
@@ -58,27 +102,30 @@ def get_text_chunks(documents):
     chunks = text_splitter.split_documents(documents)
     return chunks
 
-def get_vector_store(text_chunks):
-    """Creates or loads a FAISS vector store from text chunks."""
+def create_and_save_vector_store(text_chunks, version):
+    """Creates a new FAISS vector store and saves it with a version."""
     embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
-    if os.path.exists(VECTOR_DB_PATH):
-        vectorstore = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
-        # Assuming you want to add new documents to an existing store
-        # You might need to update this logic if you want to completely rebuild or re-index
-        st.info("Existing vector store loaded. Appending new documents if any.")
-        # For simplicity, we'll just create a new one if files are uploaded.
-        # In a real app, you'd manage adding to/updating the existing store.
-        if text_chunks: # Only add if new chunks are provided
-            new_vectorstore = FAISS.from_documents(text_chunks, embeddings)
-            vectorstore.merge_from(new_vectorstore)
-            vectorstore.save_local(VECTOR_DB_PATH)
-            st.success("New documents added to the vector store.")
-    else:
-        st.info("Creating new vector store...")
-        vectorstore = FAISS.from_documents(text_chunks, embeddings)
-        vectorstore.save_local(VECTOR_DB_PATH)
-        st.success("Vector store created and saved.")
+    version_dir = os.path.join(BASE_VECTOR_DB_DIR, version)
+    os.makedirs(version_dir, exist_ok=True)
+    
+    st.info(f"Creating new vector store for version {version}...")
+    vectorstore = FAISS.from_documents(text_chunks, embeddings)
+    vectorstore.save_local(version_dir)
+    st.success(f"Vector store {version} created and saved at {version_dir}.")
     return vectorstore
+
+def load_vector_store_by_version(version):
+    """Loads a specific FAISS vector store by its version."""
+    version_dir = os.path.join(BASE_VECTOR_DB_DIR, version)
+    if os.path.exists(version_dir):
+        embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
+        st.info(f"Loading vector store version {version}...")
+        vectorstore = FAISS.load_local(version_dir, embeddings, allow_dangerous_deserialization=True)
+        st.success(f"Vector store version {version} loaded successfully!")
+        return vectorstore
+    else:
+        st.error(f"Vector store for version {version} not found at {version_dir}.")
+        return None
 
 def get_conversational_chain():
     """Defines the conversational chain with a rephrasing prompt."""
@@ -94,9 +141,6 @@ def get_conversational_chain():
     Your thoughtful and rephrased response:
     """
     
-    # We use a slight variation for the rephrasing part to encourage natural language.
-    # The conversational chain automatically handles context.
-    
     llm = Ollama(model=OLLAMA_MODEL)
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
@@ -107,41 +151,95 @@ def get_conversational_chain():
 st.set_page_config(page_title="Conversational RAG with Ollama", layout="wide")
 
 st.title("📚 Your Personal Knowledge Navigator")
-st.markdown("Upload your documents (PDF, PPT, DOC, MD, TXT), and let's chat about them!")
+st.markdown("Upload your documents (PDF, PPT, DOC, MD, TXT), or load a saved knowledge base, and let's chat about them!")
+
+# Ensure base directories exist on app start
+ensure_base_directories_exist()
 
 # Sidebar for document upload and processing
 with st.sidebar:
-    st.header("Upload Your Knowledge")
+    st.header("Build or Load Your Knowledge Base")
+
+    # --- Upload and Process New Documents ---
+    st.subheader("1. Build a New Knowledge Base")
     uploaded_files = st.file_uploader(
-        "Choose your files (PDF, PPT, DOC, MD, TXT)",
+        "Choose new files (PDF, PPT, DOC, MD, TXT)",
         type=["pdf", "ppt", "pptx", "doc", "docx", "md", "txt"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="new_files_uploader"
     )
 
     if uploaded_files:
-        if st.button("Process Documents"):
-            os.makedirs("temp", exist_ok=True) # Create a temporary directory for uploaded files
+        if st.button("Create New Knowledge Base"):
             with st.spinner("Loading and processing documents... This might take a moment."):
-                documents = load_documents(uploaded_files)
+                documents, uploaded_file_paths = load_documents(uploaded_files)
                 if documents:
                     text_chunks = get_text_chunks(documents)
-                    st.session_state.vector_store = get_vector_store(text_chunks)
-                    st.success("Documents processed and knowledge base updated!")
+                    current_version = get_next_version_number()
+                    st.session_state.vector_store = create_and_save_vector_store(text_chunks, current_version)
+                    
+                    # Log file details for this version
+                    file_names = ", ".join([os.path.basename(p) for p in uploaded_file_paths])
+                    file_paths_str = ", ".join(uploaded_file_paths)
+                    update_master_version_control(current_version, f"Names: {file_names} | Paths: {file_paths_str}")
+                    
+                    st.session_state.current_kb_version = current_version
+                    st.success(f"New knowledge base '{current_version}' created and ready!")
                 else:
                     st.error("No supported documents were loaded. Please check file types.")
             # Clean up temporary files
-            for f in os.listdir("temp"):
-                os.remove(os.path.join("temp", f))
-            os.rmdir("temp")
-    else:
-        st.info("Upload documents to start building your knowledge base.")
+            if os.path.exists("temp"):
+                shutil.rmtree("temp") # Remove temp directory and its contents
+            os.makedirs("temp", exist_ok=True) # Recreate empty temp directory for next uploads
+    
+    st.markdown("---")
 
-# Initialize chat history
+    # --- Load Existing Knowledge Base ---
+    st.subheader("2. Load an Existing Knowledge Base")
+    
+    # Get available versions from MasterVersionControl.csv
+    available_versions = []
+    if os.path.exists(MASTER_VERSION_CONTROL_FILE):
+        try:
+            df_versions = pd.read_csv(MASTER_VERSION_CONTROL_FILE)
+            if not df_versions.empty:
+                available_versions = df_versions['Version'].tolist()
+                available_versions.sort(key=lambda x: float(x.replace('v', '')), reverse=True) # Sort numerically
+        except pd.errors.EmptyDataError:
+            st.info("MasterVersionControl.csv is empty. No previous versions to load.")
+    
+    if available_versions:
+        selected_version = st.selectbox(
+            "Select a saved knowledge base version:",
+            options=["-- Select --"] + available_versions,
+            key="version_selector"
+        )
+
+        if selected_version != "-- Select --":
+            if st.button(f"Load '{selected_version}' Knowledge Base"):
+                st.session_state.vector_store = load_vector_store_by_version(selected_version)
+                if st.session_state.vector_store:
+                    st.session_state.current_kb_version = selected_version
+                    st.success(f"Knowledge base '{selected_version}' loaded!")
+                else:
+                    st.error(f"Failed to load knowledge base '{selected_version}'.")
+    else:
+        st.info("No saved knowledge bases found. Create one first!")
+
+    st.markdown("---")
+    if "current_kb_version" in st.session_state and st.session_state.current_kb_version:
+        st.info(f"**Active Knowledge Base:** {st.session_state.current_kb_version}")
+    else:
+        st.info("No knowledge base currently active.")
+
+
+# Initialize chat history and vector store in session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "vector_store" not in st.session_state:
     st.session_state.vector_store = None
-    st.info("No knowledge base loaded yet. Please upload and process documents in the sidebar.")
+if "current_kb_version" not in st.session_state:
+    st.session_state.current_kb_version = None
 
 # Display chat messages from history on app rerun
 for message in st.session_state.messages:
@@ -151,7 +249,7 @@ for message in st.session_state.messages:
         st.chat_message("assistant").write(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Ask me anything about your documents..."):
+if prompt := st.chat_input("Ask me anything about the active knowledge base..."):
     st.chat_message("user").write(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
@@ -160,11 +258,9 @@ if prompt := st.chat_input("Ask me anything about your documents..."):
             docs = st.session_state.vector_store.similarity_search(prompt)
             chain = get_conversational_chain()
             
-            # The LLM will rephrase the answer based on the prompt template.
-            # We pass the question directly as the 'question' in the chain.
             response = chain.run(input_documents=docs, question=prompt)
             
             st.chat_message("assistant").write(response)
             st.session_state.messages.append({"role": "assistant", "content": response})
     else:
-        st.chat_message("assistant").write("Please upload and process documents first to enable the knowledge base.")
+        st.chat_message("assistant").write("Please load or create a knowledge base first to start chatting.")

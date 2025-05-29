@@ -9,4 +9,5 @@ langchain_ollama
 faiss-cpu 
 pypdf 
 python-dotenv
+pandas
 unstructured[all-docs]
