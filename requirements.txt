@@ -1,0 +1,12 @@
+# List your project dependencies here
+dotenv
+pytest
+streamlit 
+langchain 
+langchain-community 
+langchain-core 
+langchain_ollama
+faiss-cpu 
+pypdf 
+python-dotenv
+unstructured[all-docs]
