@@ -46,12 +46,57 @@ def get_next_version_number():
     next_version = f"v{latest_version + 1:.1f}"
     return next_version
 
-def update_master_version_control(version, file_details):
+def get_knowledge_base_name(documents):
+    """
+    Uses LLM to suggest a descriptive name for the knowledge base
+    based on the content of the first few documents.
+    """
+    llm = Ollama(model=OLLAMA_MODEL)
+
+    # Take content from the first few documents for a concise overview
+    # Limit to avoid sending too much text to LLM
+    combined_content = ""
+    for doc in documents[:5]: # Consider content from up to 5 documents
+        combined_content += doc.page_content[:1000] # Take first 1000 chars from each
+        if len(combined_content) > 3000: # Max 3000 chars for prompt
+            break
+
+    if not combined_content:
+        return "Unnamed_Knowledge_Base"
+
+    name_prompt = PromptTemplate(
+        template="""Based on the following document content, suggest a short (2-5 words), descriptive, and suitable name for a knowledge base that contains this information. The name should be concise, use underscores instead of spaces, and contain only lowercase letters and numbers. Avoid file extensions or specific document names.
+
+Content:
+{content}
+
+Suggested Name:""",
+        input_variables=["content"]
+    )
+
+    try:
+        response = llm.invoke(name_prompt.format(content=combined_content))
+        # Basic cleaning: lowercase, replace spaces/dashes with underscores, remove special chars
+        cleaned_name = "".join(char if char.isalnum() or char == '_' else '_' for char in response).lower()
+        cleaned_name = "_".join(filter(None, cleaned_name.split('_'))) # Remove multiple underscores
+
+        # Ensure it's not empty and has a reasonable length
+        if not cleaned_name or len(cleaned_name) < 3:
+            return "general_knowledge"
+
+        # Limit length to avoid extremely long directory names
+        return cleaned_name[:50]
+    except Exception as e:
+        st.warning(f"Could not generate a smart name for the knowledge base. Using default. Error: {e}")
+        return "default_knowledge_base"
+
+def update_master_version_control(version_label, file_details, generated_name): # <-- CHANGED
     """Updates the MasterVersionControl.csv with details of the new vector store version."""
     new_entry = {
-        "Version": version,
+        "Version": version_label,
+        "Generated_Name": generated_name, # <-- NEW LINE
         "Timestamp": datetime.now().isoformat(),
-        "Files_Used": file_details # This will be a string of file names
+        "Files_Used": file_details
     }
     
     df_new = pd.DataFrame([new_entry])
@@ -102,17 +147,35 @@ def get_text_chunks(documents):
     chunks = text_splitter.split_documents(documents)
     return chunks
 
-def create_and_save_vector_store(text_chunks, version):
-    """Creates a new FAISS vector store and saves it with a version."""
+def create_and_save_vector_store(text_chunks, version_label, generated_name): # <-- CHANGED
+    """Creates a new FAISS vector store and saves it with a version and generated name."""
     embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
-    version_dir = os.path.join(BASE_VECTOR_DB_DIR, version)
-    os.makedirs(version_dir, exist_ok=True)
-    
-    st.info(f"Creating new vector store for version {version}...")
+
+    # Combine version and generated name for a descriptive directory name
+    version_dir_name = f"{version_label}_{generated_name}" # <-- CHANGED
+    version_dir_path = os.path.join(BASE_VECTOR_DB_DIR, version_dir_name) # <-- CHANGED
+    os.makedirs(version_dir_path, exist_ok=True)
+
+    st.info(f"Creating new vector store '{version_label}' ({generated_name})...") # <-- CHANGED
     vectorstore = FAISS.from_documents(text_chunks, embeddings)
-    vectorstore.save_local(version_dir)
-    st.success(f"Vector store {version} created and saved at {version_dir}.")
+    vectorstore.save_local(version_dir_path) # <-- CHANGED
+    st.success(f"Vector store '{version_label}' ({generated_name}) created and saved.") # <-- CHANGED
     return vectorstore
+
+def load_vector_store_by_version_and_name(version_label, generated_name): # <-- NEW NAME & PARAMS
+    """Loads a specific FAISS vector store by its version and generated name."""
+    version_dir_name = f"{version_label}_{generated_name}" # <-- CHANGED
+    version_dir_path = os.path.join(BASE_VECTOR_DB_DIR, version_dir_name) # <-- CHANGED
+
+    if os.path.exists(version_dir_path):
+        embeddings = OllamaEmbeddings(model=OLLAMA_MODEL)
+        st.info(f"Loading knowledge base '{version_label}' ({generated_name})...") # <-- CHANGED
+        vectorstore = FAISS.load_local(version_dir_path, embeddings, allow_dangerous_deserialization=True) # <-- CHANGED
+        st.success(f"Knowledge base '{version_label}' ({generated_name}) loaded successfully!") # <-- CHANGED
+        return vectorstore
+    else:
+        st.error(f"Knowledge base for '{version_label}' ({generated_name}) not found at {version_dir_path}.") # <-- CHANGED
+        return None
 
 def load_vector_store_by_version(version):
     """Loads a specific FAISS vector store by its version."""
@@ -171,20 +234,28 @@ with st.sidebar:
 
     if uploaded_files:
         if st.button("Create New Knowledge Base"):
-            with st.spinner("Loading and processing documents... This might take a moment."):
+            with st.spinner("Loading and processing documents and generating name..."): # <-- CHANGED SPINNER MESSAGE
                 documents, uploaded_file_paths = load_documents(uploaded_files)
                 if documents:
+                    # --- NEW STEP: Get LLM-generated name ---
+                    generated_name = get_knowledge_base_name(documents) # <-- NEW LINE
+                    st.info(f"Suggested Knowledge Base Name: **{generated_name}**") # <-- NEW LINE
+
                     text_chunks = get_text_chunks(documents)
-                    current_version = get_next_version_number()
-                    st.session_state.vector_store = create_and_save_vector_store(text_chunks, current_version)
-                    
-                    # Log file details for this version
+                    current_version_label = get_next_version_number() # <-- CHANGED VARIABLE NAME
+
+                    st.session_state.vector_store = create_and_save_vector_store( # <-- CHANGED FUNCTION CALL
+                        text_chunks, current_version_label, generated_name # <-- ADDED generated_name
+                    )
+
+                    # Log file details for this version, including the generated name
                     file_names = ", ".join([os.path.basename(p) for p in uploaded_file_paths])
                     file_paths_str = ", ".join(uploaded_file_paths)
-                    update_master_version_control(current_version, f"Names: {file_names} | Paths: {file_paths_str}")
-                    
-                    st.session_state.current_kb_version = current_version
-                    st.success(f"New knowledge base '{current_version}' created and ready!")
+                    update_master_version_control(current_version_label, f"Names: {file_names} | Paths: {file_paths_str}", generated_name) # <-- ADDED generated_name
+
+                    st.session_state.current_kb_version_label = current_version_label # <-- CHANGED SESSION STATE KEY
+                    st.session_state.current_kb_generated_name = generated_name # <-- NEW SESSION STATE KEY
+                    st.success(f"New knowledge base '{current_version_label}' ({generated_name}) created and ready!") # <-- CHANGED SUCCESS MESSAGE
                 else:
                     st.error("No supported documents were loaded. Please check file types.")
             # Clean up temporary files
@@ -198,34 +269,65 @@ with st.sidebar:
     st.subheader("2. Load an Existing Knowledge Base")
     
     # Get available versions from MasterVersionControl.csv
-    available_versions = []
+    available_versions_data = [] # Store tuples of (version_label, generated_name) # <-- CHANGED
     if os.path.exists(MASTER_VERSION_CONTROL_FILE):
         try:
             df_versions = pd.read_csv(MASTER_VERSION_CONTROL_FILE)
-            if not df_versions.empty:
-                available_versions = df_versions['Version'].tolist()
-                available_versions.sort(key=lambda x: float(x.replace('v', '')), reverse=True) # Sort numerically
+            if not df_versions.empty and 'Generated_Name' in df_versions.columns: # <-- CHANGED CONDITION
+                # Create a display string for the selectbox: "vX.Y (generated_name)"
+                available_versions_data = [(row['Version'], row['Generated_Name']) for index, row in df_versions.iterrows()] # <-- CHANGED
+                # Sort numerically by version label
+                available_versions_data.sort(key=lambda x: float(x[0].replace('v', '')), reverse=True) # <-- CHANGED
+            elif not df_versions.empty: # Handle older CSVs without Generated_Name column # <-- NEW BLOCK
+                st.warning("MasterVersionControl.csv found but lacks 'Generated_Name' column. Please recreate if naming is desired.")
+                available_versions_data = [(row['Version'], "Unnamed_KB") for index, row in df_versions.iterrows()]
+                available_versions_data.sort(key=lambda x: float(x[0].replace('v', '')), reverse=True)
+
         except pd.errors.EmptyDataError:
             st.info("MasterVersionControl.csv is empty. No previous versions to load.")
-    
-    if available_versions:
-        selected_version = st.selectbox(
-            "Select a saved knowledge base version:",
-            options=["-- Select --"] + available_versions,
-            key="version_selector"
-        )
 
-        if selected_version != "-- Select --":
-            if st.button(f"Load '{selected_version}' Knowledge Base"):
-                st.session_state.vector_store = load_vector_store_by_version(selected_version)
-                if st.session_state.vector_store:
-                    st.session_state.current_kb_version = selected_version
-                    st.success(f"Knowledge base '{selected_version}' loaded!")
-                else:
-                    st.error(f"Failed to load knowledge base '{selected_version}'.")
+    display_options = ["-- Select --"] + [f"{v_label} ({g_name})" for v_label, g_name in available_versions_data] # <-- CHANGED DISPLAY OPTIONS
+
+    selected_display_option = st.selectbox( # <-- CHANGED VARIABLE NAME
+        "Select a saved knowledge base version:",
+        options=display_options, # <-- CHANGED
+        key="version_selector"
+    )
+
+    selected_version_label = None # <-- NEW VARS
+    selected_generated_name = None # <-- NEW VARS
+    if selected_display_option != "-- Select --":
+        # Extract version label and generated name from the selected string
+        try:
+            # Assumes format "vX.Y (name_with_underscores)"
+            parts = selected_display_option.split(' ', 1) # Split at first space
+            selected_version_label = parts[0]
+            selected_generated_name = parts[1][1:-1] # Remove parentheses
+        except IndexError:
+            st.error("Could not parse selected version name. Please re-check MasterVersionControl.csv format.")
+            selected_version_label = None
+            selected_generated_name = None
+
+    if selected_version_label and selected_generated_name: # <-- CHANGED CONDITION
+        if st.button(f"Load '{selected_version_label}' ({selected_generated_name}) Knowledge Base"): # <-- CHANGED BUTTON TEXT
+            st.session_state.vector_store = load_vector_store_by_version_and_name( # <-- CHANGED FUNCTION CALL
+                selected_version_label, selected_generated_name # <-- CHANGED PARAMS
+            )
+            if st.session_state.vector_store:
+                st.session_state.current_kb_version_label = selected_version_label # <-- CHANGED SESSION STATE KEYS
+                st.session_state.current_kb_generated_name = selected_generated_name # <-- NEW SESSION STATE KEY
+                st.success(f"Knowledge base '{selected_version_label}' ({selected_generated_name}) loaded!") # <-- CHANGED SUCCESS MESSAGE
+            else:
+                st.error(f"Failed to load knowledge base '{selected_version_label}' ({selected_generated_name}).") # <-- CHANGED ERROR MESSAGE
+    else: # <-- CHANGED ELSE BLOCK
+        st.info("No saved knowledge bases found or selected.")
+
+    st.markdown("---")
+    if "current_kb_version_label" in st.session_state and st.session_state.current_kb_version_label: # <-- CHANGED SESSION STATE KEY
+        st.info(f"**Active Knowledge Base:** {st.session_state.current_kb_version_label} ({st.session_state.current_kb_generated_name})") # <-- CHANGED DISPLAY
     else:
-        st.info("No saved knowledge bases found. Create one first!")
-
+        st.info("No knowledge base currently active.")
+        
     st.markdown("---")
     if "current_kb_version" in st.session_state and st.session_state.current_kb_version:
         st.info(f"**Active Knowledge Base:** {st.session_state.current_kb_version}")
